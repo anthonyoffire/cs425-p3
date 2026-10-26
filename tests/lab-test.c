@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include "harness/unity.h"
 #include "../src/lab.h"
@@ -52,6 +53,8 @@ void test_cidr_parse_valid_blocks(void) {
   TEST_ASSERT_EQUAL_UINT8(25, block.prefix);
   TEST_ASSERT_TRUE(cidr_parse("0.0.0.0/0", &block));
   TEST_ASSERT_EQUAL_UINT8(0, block.prefix);
+  TEST_ASSERT_TRUE(cidr_parse("192.0.2.2/31", &block));
+  TEST_ASSERT_EQUAL_UINT8(31, block.prefix);
   TEST_ASSERT_TRUE(cidr_parse("255.255.255.255/32", &block));
   TEST_ASSERT_EQUAL_UINT8(32, block.prefix);
 }
@@ -86,6 +89,7 @@ void test_cidr_format(void) {
 
 void test_cidr_mask(void) {
   TEST_ASSERT_EQUAL_HEX32(UINT32_C(0), cidr_mask(0));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0x80000000), cidr_mask(1));
   TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xFFFFFF00), cidr_mask(24));
   TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xFFFFFFFE), cidr_mask(31));
   TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, cidr_mask(32));
@@ -117,6 +121,28 @@ void test_cidr_network_broadcast_and_host_ranges(void) {
   block = (cidr_t){.addr = UINT32_MAX, .prefix = 32};
   TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, cidr_network(block));
   TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, cidr_broadcast(block));
+}
+
+void test_cidr_slash30_31_and_32_boundaries(void) {
+  cidr_t block = {.addr = UINT32_C(0xC0000202), .prefix = 30};
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000200), cidr_network(block));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000203), cidr_broadcast(block));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000201), cidr_first_host(block));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000202), cidr_last_host(block));
+
+  block = (cidr_t){.addr = UINT32_C(0xC0000202), .prefix = 31};
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000202), cidr_network(block));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0xC0000203), cidr_broadcast(block));
+  TEST_ASSERT_TRUE(cidr_contains(block, UINT32_C(0xC0000202)));
+  TEST_ASSERT_TRUE(cidr_contains(block, UINT32_C(0xC0000203)));
+  TEST_ASSERT_FALSE(cidr_contains(block, UINT32_C(0xC0000204)));
+
+  block = (cidr_t){.addr = UINT32_C(0xC0000202), .prefix = 32};
+  TEST_ASSERT_TRUE(cidr_contains(block, UINT32_C(0xC0000202)));
+  TEST_ASSERT_FALSE(cidr_contains(block, UINT32_C(0xC0000203)));
+  TEST_ASSERT_EQUAL_UINT64(UINT64_C(1), cidr_host_count(block));
+  TEST_ASSERT_EQUAL_UINT64(UINT64_C(2147483646),
+                           cidr_host_count((cidr_t){.addr = 0, .prefix = 1}));
 }
 
 void test_cidr_host_count(void) {
@@ -159,6 +185,20 @@ void test_cidr_subnet(void) {
   TEST_ASSERT_EQUAL_UINT8(0, subnet.prefix);
 }
 
+void test_cidr_subnet_extreme_valid_requests(void) {
+  cidr_t subnet = {0};
+  cidr_t single_address = {.addr = UINT32_MAX, .prefix = 32};
+  TEST_ASSERT_TRUE(cidr_subnet(single_address, 1, 0, &subnet));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_MAX, subnet.addr);
+  TEST_ASSERT_EQUAL_UINT8(32, subnet.prefix);
+
+  cidr_t half_space = {.addr = 0, .prefix = 1};
+  TEST_ASSERT_TRUE(cidr_subnet(half_space, UINT32_C(0x80000000),
+                               UINT32_C(0x7FFFFFFF), &subnet));
+  TEST_ASSERT_EQUAL_HEX32(UINT32_C(0x7FFFFFFF), subnet.addr);
+  TEST_ASSERT_EQUAL_UINT8(32, subnet.prefix);
+}
+
 void test_cidr_subnet_rejects_invalid_requests_without_modifying_output(void) {
   cidr_t subnet = {.addr = UINT32_C(0x12345678), .prefix = 12};
   cidr_t unaligned = {.addr = UINT32_C(0xC0A80101), .prefix = 24};
@@ -189,6 +229,9 @@ void test_route_parse(void) {
   TEST_ASSERT_EQUAL_UINT8(24, route.dest.prefix);
   TEST_ASSERT_EQUAL_HEX32(UINT32_C(0), route.gateway);
   TEST_ASSERT_EQUAL_STRING("eth2", route.dev);
+
+  TEST_ASSERT_TRUE(route_parse("default direct 123456789012345", &route));
+  TEST_ASSERT_EQUAL_STRING("123456789012345", route.dev);
 }
 
 void test_route_parse_rejects_invalid_lines_without_modifying_output(void) {
@@ -427,6 +470,48 @@ void test_table_load_reports_read_errors(void)
   table_destroy(table);
 }
 
+typedef struct {
+  const char *data;
+  size_t length;
+  size_t offset;
+} partial_read_cookie_t;
+
+static ssize_t partial_then_fail_read(void *cookie, char *buffer, size_t size)
+{
+  partial_read_cookie_t *state = cookie;
+  if (state->offset < state->length) {
+    size_t remaining = state->length - state->offset;
+    size_t amount = remaining < size ? remaining : size;
+    memcpy(buffer, state->data + state->offset, amount);
+    state->offset += amount;
+    return (ssize_t)amount;
+  }
+
+  errno = EIO;
+  return -1;
+}
+
+void test_table_load_keeps_routes_before_late_read_error(void)
+{
+  const char route_line[] = "10.0.0.0/8 direct eth0\n";
+  partial_read_cookie_t state = {
+      .data = route_line,
+      .length = sizeof(route_line) - 1U,
+      .offset = 0
+  };
+  cookie_io_functions_t functions = {.read = partial_then_fail_read};
+  FILE *in = fopencookie(&state, "r", functions);
+  TEST_ASSERT_NOT_NULL(in);
+
+  fwd_table_t *table = table_create();
+  size_t bad_line = 17;
+  TEST_ASSERT_FALSE(table_load(table, in, &bad_line));
+  TEST_ASSERT_EQUAL_size_t(0, bad_line);
+  TEST_ASSERT_EQUAL_size_t(1, table_count(table));
+  (void)fclose(in);
+  table_destroy(table);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_ip_parse_valid_addresses);
@@ -437,9 +522,11 @@ int main(void) {
   RUN_TEST(test_cidr_format);
   RUN_TEST(test_cidr_mask);
   RUN_TEST(test_cidr_network_broadcast_and_host_ranges);
+  RUN_TEST(test_cidr_slash30_31_and_32_boundaries);
   RUN_TEST(test_cidr_host_count);
   RUN_TEST(test_cidr_contains_and_network_check);
   RUN_TEST(test_cidr_subnet);
+  RUN_TEST(test_cidr_subnet_extreme_valid_requests);
   RUN_TEST(test_cidr_subnet_rejects_invalid_requests_without_modifying_output);
   RUN_TEST(test_route_parse);
   RUN_TEST(test_route_parse_rejects_invalid_lines_without_modifying_output);
@@ -451,5 +538,6 @@ int main(void) {
   RUN_TEST(test_table_load_comments_and_reports_first_bad_line);
   RUN_TEST(test_table_load_invalid_arguments);
   RUN_TEST(test_table_load_reports_read_errors);
+  RUN_TEST(test_table_load_keeps_routes_before_late_read_error);
   return UNITY_END();
 }
