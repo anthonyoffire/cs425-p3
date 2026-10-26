@@ -4,13 +4,272 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include "harness/unity.h"
 #include "../src/lab.h"
+
+int main_exclude(int argc, char *argv[]);
 
 void setUp(void) {
 }
 
 void tearDown(void) {
+}
+
+static bool read_captured(FILE *stream, char *buffer, size_t capacity)
+{
+  if (capacity == 0 || fflush(stream) != 0 || fseek(stream, 0, SEEK_SET) != 0) {
+    return false;
+  }
+
+  size_t length = fread(buffer, 1, capacity - 1U, stream);
+  if (ferror(stream) != 0 || length == capacity - 1U) {
+    return false;
+  }
+  buffer[length] = '\0';
+  return true;
+}
+
+static int invoke_cli(int argc, char *argv[], char *stdout_text,
+                      size_t stdout_capacity, char *stderr_text,
+                      size_t stderr_capacity)
+{
+  FILE *captured_stdout = tmpfile();
+  FILE *captured_stderr = tmpfile();
+  if (captured_stdout == NULL || captured_stderr == NULL) {
+    if (captured_stdout != NULL) {
+      (void)fclose(captured_stdout);
+    }
+    if (captured_stderr != NULL) {
+      (void)fclose(captured_stderr);
+    }
+    return -1;
+  }
+
+  (void)fflush(NULL);
+  int saved_stdout = dup(STDOUT_FILENO);
+  int saved_stderr = dup(STDERR_FILENO);
+  if (saved_stdout < 0 || saved_stderr < 0 ||
+      dup2(fileno(captured_stdout), STDOUT_FILENO) < 0 ||
+      dup2(fileno(captured_stderr), STDERR_FILENO) < 0) {
+    if (saved_stdout >= 0) {
+      (void)dup2(saved_stdout, STDOUT_FILENO);
+      (void)close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+      (void)dup2(saved_stderr, STDERR_FILENO);
+      (void)close(saved_stderr);
+    }
+    (void)fclose(captured_stdout);
+    (void)fclose(captured_stderr);
+    return -1;
+  }
+
+  int status = main_exclude(argc, argv);
+  (void)fflush(NULL);
+  bool stdout_restored = dup2(saved_stdout, STDOUT_FILENO) >= 0;
+  bool stderr_restored = dup2(saved_stderr, STDERR_FILENO) >= 0;
+  (void)close(saved_stdout);
+  (void)close(saved_stderr);
+
+  bool captured = read_captured(captured_stdout, stdout_text, stdout_capacity) &&
+                  read_captured(captured_stderr, stderr_text, stderr_capacity);
+  (void)fclose(captured_stdout);
+  (void)fclose(captured_stderr);
+  return stdout_restored && stderr_restored && captured ? status : -1;
+}
+
+static bool write_route_file(char path[64], const char *contents)
+{
+  (void)strcpy(path, "/tmp/cs425-p3-routes-XXXXXX");
+  int fd = mkstemp(path);
+  if (fd < 0) {
+    return false;
+  }
+
+  size_t length = strlen(contents);
+  ssize_t written = write(fd, contents, length);
+  bool ok = written >= 0 && (size_t)written == length;
+  if (close(fd) != 0) {
+    ok = false;
+  }
+  if (!ok) {
+    (void)unlink(path);
+  }
+  return ok;
+}
+
+void test_cli_usage_and_invalid_command_exit_codes(void)
+{
+  char out[512];
+  char err[512];
+  char *no_args[] = {"myapp", NULL};
+  TEST_ASSERT_EQUAL_INT(0, invoke_cli(1, no_args, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("Usage: myapp info <address>/<prefix>\n"
+                           "       myapp split <network>/<prefix> <count>\n"
+                           "       myapp lookup <table-file> <address>...\n",
+                           out);
+  TEST_ASSERT_EQUAL_STRING("", err);
+
+  char *unknown[] = {"myapp", "unknown", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(2, unknown, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid command line\n"
+                           "Usage: myapp info <address>/<prefix>\n"
+                           "       myapp split <network>/<prefix> <count>\n"
+                           "       myapp lookup <table-file> <address>...\n",
+                           err);
+
+  char *short_split[] = {"myapp", "split", "192.0.2.0/24", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(3, short_split, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid command line\n"
+                           "Usage: myapp info <address>/<prefix>\n"
+                           "       myapp split <network>/<prefix> <count>\n"
+                           "       myapp lookup <table-file> <address>...\n",
+                           err);
+
+  char *short_lookup[] = {"myapp", "lookup", "routes.txt", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(3, short_lookup, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid command line\n"
+                           "Usage: myapp info <address>/<prefix>\n"
+                           "       myapp split <network>/<prefix> <count>\n"
+                           "       myapp lookup <table-file> <address>...\n",
+                           err);
+
+  char *wrong_arity[] = {"myapp", "info", "192.0.2.1/24", "extra", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(4, wrong_arity, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid command line\n"
+                           "Usage: myapp info <address>/<prefix>\n"
+                           "       myapp split <network>/<prefix> <count>\n"
+                           "       myapp lookup <table-file> <address>...\n",
+                           err);
+}
+
+void test_cli_info_output_and_error_exit_code(void)
+{
+  char out[512];
+  char err[512];
+  char *valid[] = {"myapp", "info", "192.0.2.5/32", NULL};
+  TEST_ASSERT_EQUAL_INT(0, invoke_cli(3, valid, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("address    192.0.2.5\n"
+                           "prefix     /32\n"
+                           "netmask    255.255.255.255\n"
+                           "network    192.0.2.5\n"
+                           "broadcast  192.0.2.5\n"
+                           "first host 192.0.2.5\n"
+                           "last host  192.0.2.5\n"
+                           "hosts      1\n",
+                           out);
+  TEST_ASSERT_EQUAL_STRING("", err);
+
+  char *zero_prefix[] = {"myapp", "info", "10.1.2.3/0", NULL};
+  TEST_ASSERT_EQUAL_INT(0, invoke_cli(3, zero_prefix, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("address    10.1.2.3\n"
+                           "prefix     /0\n"
+                           "netmask    0.0.0.0\n"
+                           "network    0.0.0.0\n"
+                           "broadcast  255.255.255.255\n"
+                           "first host 0.0.0.1\n"
+                           "last host  255.255.255.254\n"
+                           "hosts      4294967294\n",
+                           out);
+
+  char *invalid[] = {"myapp", "info", "192.0.2.5/33", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(3, invalid, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid address/prefix: 192.0.2.5/33\n",
+                           err);
+}
+
+void test_cli_split_output_and_error_exit_codes(void)
+{
+  char out[512];
+  char err[512];
+  char *valid[] = {"myapp", "split", "192.0.2.0/24", "4", NULL};
+  TEST_ASSERT_EQUAL_INT(0, invoke_cli(4, valid, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("192.0.2.0/26\n"
+                           "192.0.2.64/26\n"
+                           "192.0.2.128/26\n"
+                           "192.0.2.192/26\n",
+                           out);
+  TEST_ASSERT_EQUAL_STRING("", err);
+
+  char *invalid_count[] = {"myapp", "split", "192.0.2.0/24", "3", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(4, invalid_count, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_EQUAL_STRING(
+      "myapp: subnet count must be a power of two: 3\n", err);
+
+  char *not_network[] = {"myapp", "split", "192.0.2.1/24", "2", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(4, not_network, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING(
+      "myapp: split requires a network address with no host bits set: 192.0.2.1/24\n",
+      err);
+
+  char *too_many[] = {"myapp", "split", "192.0.2.5/32", "2", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(4, too_many, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING(
+      "myapp: splitting this block would require a prefix longer than /32\n",
+      err);
+}
+
+void test_cli_lookup_output_and_exit_codes(void)
+{
+  char path[64];
+  TEST_ASSERT_TRUE(write_route_file(
+      path, "default 192.0.2.1 eth0\n"
+            "10.0.0.0/8 10.1.0.1 eth1\n"
+            "10.1.0.0/16 direct eth2\n"));
+
+  char out[512];
+  char err[512];
+  char *valid[] = {"myapp", "lookup", path, "10.1.2.3", "10.2.3.4",
+                   "8.8.8.8", NULL};
+  TEST_ASSERT_EQUAL_INT(0, invoke_cli(6, valid, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("10.1.2.3 dev eth2\n"
+                           "10.2.3.4 via 10.1.0.1 dev eth1\n"
+                           "8.8.8.8 via 192.0.2.1 dev eth0\n",
+                           out);
+  TEST_ASSERT_EQUAL_STRING("", err);
+  (void)unlink(path);
+
+  TEST_ASSERT_TRUE(write_route_file(path, "10.0.0.0/8 direct eth0\n"));
+  char *unreachable[] = {"myapp", "lookup", path, "8.8.8.8", NULL};
+  TEST_ASSERT_EQUAL_INT(3, invoke_cli(4, unreachable, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("8.8.8.8 unreachable\n", out);
+  TEST_ASSERT_EQUAL_STRING("", err);
+
+  char *invalid_address[] = {"myapp", "lookup", path, "8.8.8.x", NULL};
+  TEST_ASSERT_EQUAL_INT(1, invoke_cli(4, invalid_address, out, sizeof(out),
+                                      err, sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  TEST_ASSERT_EQUAL_STRING("myapp: invalid IPv4 address: 8.8.8.x\n", err);
+  (void)unlink(path);
+
+  TEST_ASSERT_TRUE(write_route_file(path, "broken route line\n"));
+  char *bad_table[] = {"myapp", "lookup", path, "8.8.8.8", NULL};
+  TEST_ASSERT_EQUAL_INT(2, invoke_cli(4, bad_table, out, sizeof(out), err,
+                                      sizeof(err)));
+  TEST_ASSERT_EQUAL_STRING("", out);
+  char expected_error[128];
+  (void)snprintf(expected_error, sizeof(expected_error),
+                 "myapp: %s:1: not a valid route\n", path);
+  TEST_ASSERT_EQUAL_STRING(expected_error, err);
+  (void)unlink(path);
 }
 
 void test_ip_parse_valid_addresses(void) {
@@ -514,6 +773,10 @@ void test_table_load_keeps_routes_before_late_read_error(void)
 
 int main(void) {
   UNITY_BEGIN();
+  RUN_TEST(test_cli_usage_and_invalid_command_exit_codes);
+  RUN_TEST(test_cli_info_output_and_error_exit_code);
+  RUN_TEST(test_cli_split_output_and_error_exit_codes);
+  RUN_TEST(test_cli_lookup_output_and_exit_codes);
   RUN_TEST(test_ip_parse_valid_addresses);
   RUN_TEST(test_ip_parse_rejects_malformed_addresses);
   RUN_TEST(test_ip_format);
