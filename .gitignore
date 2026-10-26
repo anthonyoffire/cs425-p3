@@ -53,4 +53,5 @@ dkms.conf
 /test-lab
 /myprogram
 /build
+/summary.md
 /.vscode/c_cpp_properties.json
